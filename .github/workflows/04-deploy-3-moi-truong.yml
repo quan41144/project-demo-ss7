@@ -1,0 +1,265 @@
+# ==========================================================================
+#  BÀI 4 — DEPLOY THEO 3 MÔI TRƯỜNG: staging · uat · release
+#
+#  Ý tưởng: MỘT file workflow phục vụ cả ba môi trường. Nhánh Git nào được
+#  push sẽ quyết định môi trường nào được triển khai.
+#
+#      push staging  →  môi trường STAGING  (tự động, không cần duyệt)
+#      push uat      →  môi trường UAT      (nghiệm thu, nên bật duyệt tay)
+#      push release  →  môi trường RELEASE  (phát hành, bắt buộc duyệt tay)
+# ==========================================================================
+name: 04 · Deploy theo môi trường
+
+on:
+  push:
+    branches: [staging, uat, release]
+  workflow_dispatch:
+    inputs:
+      moi_truong:
+        description: 'Chọn môi trường để triển khai thử'
+        type: choice
+        options: [staging, uat, release]
+        default: staging
+
+# Cho phep GITHUB_TOKEN ghi vao repo (can de day len nhanh gh-pages)
+permissions:
+  contents: write
+
+env:
+  SERVICE_DIR: quickbite-backend/user-service
+
+jobs:
+  # ------------------------------------------------------------------
+  # JOB 1 — Xác định môi trường từ tên nhánh
+  # Dùng "outputs" để truyền giá trị sang các job sau.
+  # ------------------------------------------------------------------
+  xac_dinh_moi_truong:
+    name: Xác định môi trường
+    runs-on: ubuntu-latest
+    outputs:
+      ten_moi_truong: ${{ steps.chon.outputs.ten_moi_truong }}
+      cong_dich:      ${{ steps.chon.outputs.cong_dich }}
+      can_duyet_tay:  ${{ steps.chon.outputs.can_duyet_tay }}
+      nhan_phien_ban: ${{ steps.chon.outputs.nhan_phien_ban }}
+    steps:
+      - name: Suy ra môi trường từ nhánh Git
+        id: chon
+        run: |
+          # Nếu bấm chạy tay thì lấy lựa chọn của người dùng,
+          # ngược lại lấy theo tên nhánh đang được push.
+          NHANH="${{ inputs.moi_truong || github.ref_name }}"
+          echo "Nhánh / lựa chọn: $NHANH"
+
+          case "$NHANH" in
+            staging)
+              echo "ten_moi_truong=staging"  >> $GITHUB_OUTPUT
+              echo "cong_dich=8101"          >> $GITHUB_OUTPUT
+              echo "can_duyet_tay=false"     >> $GITHUB_OUTPUT
+              echo "nhan_phien_ban=snapshot" >> $GITHUB_OUTPUT
+              ;;
+            uat)
+              echo "ten_moi_truong=uat"      >> $GITHUB_OUTPUT
+              echo "cong_dich=8102"          >> $GITHUB_OUTPUT
+              echo "can_duyet_tay=true"      >> $GITHUB_OUTPUT
+              echo "nhan_phien_ban=rc"       >> $GITHUB_OUTPUT
+              ;;
+            release)
+              echo "ten_moi_truong=release"  >> $GITHUB_OUTPUT
+              echo "cong_dich=8103"          >> $GITHUB_OUTPUT
+              echo "can_duyet_tay=true"      >> $GITHUB_OUTPUT
+              echo "nhan_phien_ban=stable"   >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::Nhánh '$NHANH' không thuộc 3 môi trường được hỗ trợ."
+              exit 1
+              ;;
+          esac
+
+      - name: Tóm tắt lựa chọn
+        run: |
+          echo "### Môi trường: \`${{ steps.chon.outputs.ten_moi_truong }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Thuộc tính | Giá trị |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Nhánh Git | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cổng triển khai | ${{ steps.chon.outputs.cong_dich }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nhãn phiên bản | ${{ steps.chon.outputs.nhan_phien_ban }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cần duyệt tay | ${{ steps.chon.outputs.can_duyet_tay }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ------------------------------------------------------------------
+  # JOB 2 — Test rồi đóng gói, gắn nhãn theo môi trường
+  # ------------------------------------------------------------------
+  kiem_thu_va_dong_goi:
+    name: Test và đóng gói
+    needs: [xac_dinh_moi_truong]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v5
+
+      - name: Cài đặt JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Cấp quyền thực thi cho Gradle Wrapper
+        run: chmod +x ./gradlew
+        working-directory: ${{ env.SERVICE_DIR }}
+
+      - name: Chạy Unit Test
+        run: ./gradlew test
+        working-directory: ${{ env.SERVICE_DIR }}
+
+      - name: Đóng gói JAR
+        run: ./gradlew bootJar
+        working-directory: ${{ env.SERVICE_DIR }}
+
+      - name: Gắn nhãn phiên bản theo môi trường
+        id: dat_ten
+        run: |
+          NHAN="${{ needs.xac_dinh_moi_truong.outputs.nhan_phien_ban }}"
+          SHA_NGAN="${GITHUB_SHA:0:7}"
+          TEN_FILE="user-service-${NHAN}-${SHA_NGAN}.jar"
+          cp "${SERVICE_DIR}/build/libs/user-service.jar" "${TEN_FILE}"
+          echo "ten_file=${TEN_FILE}" >> $GITHUB_OUTPUT
+          ls -lh "${TEN_FILE}"
+
+      - name: Lưu Artifact theo môi trường
+        uses: actions/upload-artifact@v5
+        with:
+          name: jar-${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}
+          path: ${{ steps.dat_ten.outputs.ten_file }}
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # JOB 3 — Triển khai
+  #
+  # Khối "environment" là cơ chế của GitHub: vào Settings → Environments
+  # tạo staging / uat / release, rồi bật "Required reviewers" cho uat và
+  # release. Khi đó job này sẽ DỪNG LẠI chờ người duyệt bấm Approve.
+  # ------------------------------------------------------------------
+  trien_khai:
+    name: Triển khai lên ${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}
+    needs: [xac_dinh_moi_truong, kiem_thu_va_dong_goi]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}
+    steps:
+      - name: Tải Artifact về
+        uses: actions/download-artifact@v5
+        with:
+          name: jar-${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}
+
+      - name: Giả lập triển khai
+        run: |
+          MT="${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}"
+          CONG="${{ needs.xac_dinh_moi_truong.outputs.cong_dich }}"
+          echo "=================================================="
+          echo " TRIỂN KHAI LÊN MÔI TRƯỜNG: ${MT}"
+          echo "=================================================="
+          ls -lh *.jar
+          echo ""
+          echo "Ở dự án thật, bước này sẽ là một trong các việc sau:"
+          echo "  - scp file JAR lên máy chủ rồi systemctl restart"
+          echo "  - docker build + docker push lên registry"
+          echo "  - kubectl set image deployment/user-service ..."
+          echo ""
+          echo "Cấu hình môi trường ${MT}:"
+          echo "  Cổng dịch vụ : ${CONG}"
+          echo "  Database     : quickbite_user_db_${MT}"
+          echo ""
+          echo "Biến lấy từ GitHub Environment (Settings → Environments):"
+          echo "  API_URL = ${{ vars.API_URL || '(chưa đặt — xem hướng dẫn ở BÀI 5 file LAB)' }}"
+
+      - name: Ghi kết quả
+        run: |
+          echo "### Đã triển khai lên \`${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Nhánh: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Thời điểm: $(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+
+  # ------------------------------------------------------------------
+  # JOB 4 — Cập nhật bảng trạng thái trên GitHub Pages
+  #
+  # Không cần domain, không cần máy chủ. Job này ghi một file JSON lên
+  # nhánh gh-pages; trang web ở đó tự đọc và hiển thị.
+  #   https://caotv1512.github.io/project-demo/
+  # ------------------------------------------------------------------
+  cap_nhat_bang_trang_thai:
+    name: Cập nhật bảng trạng thái
+    needs: [xac_dinh_moi_truong, trien_khai]
+    runs-on: ubuntu-latest
+
+    # Ba nhánh có thể deploy cùng lúc và cùng muốn ghi vào nhánh gh-pages.
+    # Khối concurrency xếp chúng vào MỘT hàng đợi chung, chạy lần lượt,
+    # nhờ vậy không còn cảnh hai job đẩy đè lên nhau.
+    # cancel-in-progress: false -> đợi cho xong, KHÔNG huỷ job đang chạy
+    concurrency:
+      group: ghi-trang-trang-thai
+      cancel-in-progress: false
+
+    steps:
+      - name: Lấy nhánh gh-pages về
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+
+      - name: Ghi thông tin lần triển khai
+        env:
+          MT:   ${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}
+          CONG: ${{ needs.xac_dinh_moi_truong.outputs.cong_dich }}
+          NHAN: ${{ needs.xac_dinh_moi_truong.outputs.nhan_phien_ban }}
+        run: |
+          cat > "${MT}.json" <<JSON
+          {
+            "moi_truong":     "${MT}",
+            "nhanh":          "${GITHUB_REF_NAME}",
+            "commit":         "${GITHUB_SHA}",
+            "commit_ngan":    "${GITHUB_SHA:0:7}",
+            "nhan_phien_ban": "${NHAN}",
+            "cong":           "${CONG}",
+            "nguoi_day":      "${GITHUB_ACTOR}",
+            "thoi_diem":      "$(TZ='Asia/Ho_Chi_Minh' date '+%d/%m/%Y %H:%M:%S')",
+            "thoi_diem_iso":  "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "link_run":       "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          }
+          JSON
+          echo "Nội dung vừa ghi:"
+          cat "${MT}.json"
+
+      - name: Đẩy lên nhánh gh-pages
+        env:
+          MT: ${{ needs.xac_dinh_moi_truong.outputs.ten_moi_truong }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${MT}.json"
+          # Nếu không có gì đổi thì thoát êm, không để job đỏ
+          git diff --staged --quiet && { echo "Không có thay đổi."; exit 0; }
+          git commit -m "chore(pages): cap nhat trang thai ${MT} - ${GITHUB_SHA:0:7}"
+
+          # Lớp bảo vệ thứ hai: nếu vẫn bị từ chối (có người đẩy trước),
+          # kéo về rồi xếp commit của mình lên trên, thử lại tối đa 5 lần.
+          for lan in 1 2 3 4 5; do
+            if git push; then
+              echo "Đẩy thành công ở lần thử ${lan}."
+              exit 0
+            fi
+            echo "Lần ${lan} bị từ chối — có người đẩy trước. Đang kéo về rồi thử lại..."
+            git pull --rebase origin gh-pages
+            sleep $(( lan * 3 ))
+          done
+          echo "::error::Không đẩy được lên gh-pages sau 5 lần thử."
+          exit 1
+
+      - name: In địa chỉ trang trạng thái
+        run: |
+          TRANG="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+          echo "### Bảng trạng thái đã cập nhật" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[$TRANG]($TRANG)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Mở trang trên và làm mới để thấy commit \`${GITHUB_SHA:0:7}\` vừa xuất hiện." >> $GITHUB_STEP_SUMMARY
